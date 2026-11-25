@@ -7,6 +7,7 @@ import {
   deleteBranch,
   detectRepo,
   initRepo,
+  parseOverwriteConflict,
   readState,
   switchBranch,
 } from '../lib/git.js'
@@ -214,6 +215,85 @@ test('createBranch refuses an existing local branch', async () => {
     () => createBranch(run, 'E:/repo', 'main'),
     (error) => error instanceof GitError && error.code === 'BRANCH_EXISTS',
   )
+})
+
+test('createBranch explains an untracked-file overwrite in plain language', async () => {
+  const stderr = [
+    'error: The following untracked working tree files would be overwritten by checkout:',
+    '\tonly-on-other.txt',
+    '\tnotes/draft.md',
+    'Please move or remove them before you switch branches.',
+    'Aborting',
+  ].join('\n')
+  const { run } = makeRunner((args) => {
+    if (args[0] === 'check-ref-format') return { code: 0 }
+    if (args[0] === 'show-ref') return { code: 1 }
+    if (args[0] === 'switch') return { code: 1, stderr }
+    return {}
+  })
+  await assert.rejects(
+    () => createBranch(run, 'E:/repo', 'feat/x', 'other'),
+    (error) => {
+      assert.equal(error.code, 'CREATE_FAILED')
+      assert.match(error.message, /未跟踪文件「only-on-other\.txt」、「notes\/draft\.md」/)
+      assert.match(error.message, /会被 feat\/x 覆盖/)
+      assert.match(error.message, /\.gitignore/)
+      assert.match(error.detail, /would be overwritten by checkout/)
+      return true
+    },
+  )
+})
+
+test('createBranch explains an uncommitted-change overwrite in plain language', async () => {
+  const stderr = [
+    'error: Your local changes to the following files would be overwritten by checkout:',
+    '\tsrc/a.js',
+    'Please commit your changes or stash them before you switch branches.',
+    'Aborting',
+  ].join('\n')
+  const { run } = makeRunner((args) => {
+    if (args[0] === 'check-ref-format') return { code: 0 }
+    if (args[0] === 'show-ref') return { code: 1 }
+    if (args[0] === 'switch') return { code: 1, stderr }
+    return {}
+  })
+  await assert.rejects(
+    () => createBranch(run, 'E:/repo', 'feat/y'),
+    (error) => {
+      assert.equal(error.code, 'CREATE_FAILED')
+      assert.match(error.message, /本地改动「src\/a\.js」尚未提交/)
+      assert.match(error.message, /stash/)
+      assert.ok(!error.message.includes('未跟踪文件'))
+      return true
+    },
+  )
+})
+
+test('createBranch keeps the git message when no file list is present', async () => {
+  const { run } = makeRunner((args) => {
+    if (args[0] === 'check-ref-format') return { code: 0 }
+    if (args[0] === 'show-ref') return { code: 1 }
+    if (args[0] === 'switch') return { code: 1, stderr: 'fatal: not a valid object name: nope\n' }
+    return {}
+  })
+  await assert.rejects(
+    () => createBranch(run, 'E:/repo', 'feat/z', 'nope'),
+    (error) => {
+      assert.equal(error.code, 'CREATE_FAILED')
+      assert.equal(error.message, 'fatal: not a valid object name: nope')
+      return true
+    },
+  )
+})
+
+test('parseOverwriteConflict returns undefined without a file list', () => {
+  assert.equal(parseOverwriteConflict(''), undefined)
+  assert.equal(parseOverwriteConflict('fatal: bad revision'), undefined)
+  assert.equal(parseOverwriteConflict('error: x would be overwritten by checkout:\n\nAborting'), undefined)
+  assert.deepEqual(parseOverwriteConflict('error: The following untracked working tree files would be overwritten by checkout:\n\ta\n\tb\nAborting'), {
+    untracked: true,
+    files: ['a', 'b'],
+  })
 })
 
 test('initRepo initializes only when the directory is not a repository', async () => {
