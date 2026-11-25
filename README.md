@@ -25,8 +25,6 @@ plugin_manager action=install_bundle target=<此目录绝对路径>
 | `locale/*.json` | Plugin Manager 的标题 / 描述 / 详情路径 |
 | `docs/DETAIL.md` | 详情页文档 |
 | `test/git.test.mjs` | 假 runner 的核心逻辑测试（不需要真仓库） |
-| `scripts/publish-market.mjs` | 投稿到 awesome-dsh-plugin：自检 + 生成条目 + 可选一键 fork/PR |
-| `docs/MARKET.md` | 投稿说明与前置条件 |
 
 ## 开发
 
@@ -38,12 +36,12 @@ node --test test/
 
 ## 投稿到插件市场
 
-```bash
-npm run market                              # 自检 + 生成 market/<owner>__<repo>.yml
-GITHUB_TOKEN=xxx npm run market:apply       # fork 列表仓库并开 PR
-```
+用独立的公共工具 `dsh-market-publish`（同级目录 `../dsh-market-publish`）：
 
-细节见 `docs/MARKET.md`。
+```bash
+npx dsh-market-publish                  # 自检 + 生成条目
+GITHUB_TOKEN=xxx npx dsh-market-publish --apply
+```
 
 ## 显示位置
 

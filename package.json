@@ -15,7 +15,6 @@
     "lib",
     "locale",
     "docs",
-    "scripts",
     "cordis.patch.yml",
     "icon.svg",
     "README.md"
@@ -29,8 +28,6 @@
     }
   },
   "scripts": {
-    "test": "node --test test/",
-    "market": "node scripts/publish-market.mjs",
-    "market:apply": "node scripts/publish-market.mjs --apply"
+    "test": "node --test test/"
   }
 }
