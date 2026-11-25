@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Git 分支切换",
+    "description": "在对话里直接切换或新建 Git 分支，可为非 Git 目录初始化仓库，并选择控件显示位置。",
+    "detail": "docs/DETAIL.md"
+  }
+}

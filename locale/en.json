@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Git branch switcher",
+    "description": "Switch or create Git branches from the conversation, initialize a repository, and choose where the switcher appears.",
+    "detail": "docs/DETAIL.md"
+  }
+}

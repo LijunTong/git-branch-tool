@@ -1,0 +1,4 @@
+# dsh-git-branch: one chat-side branch switcher.
+- insert:
+    - id: git-branch
+      name: dsh-git-branch
