@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "在 DSH 对话里切换或新建 Git 分支，可为非 Git 目录初始化仓库，控件位置可选。",
+  "description": "Switch and create Git branches from the DSH conversation, with repository init and a configurable chip position.",
   "keywords": [
     "dsh",
     "git"
