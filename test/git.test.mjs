@@ -11,6 +11,7 @@ import {
   readState,
   switchBranch,
 } from '../lib/git.js'
+import { apply } from '../lib/index.js'
 
 const STATUS_BRANCH = [
   '# branch.oid 0123456789abcdef0123456789abcdef01234567',
@@ -338,5 +339,203 @@ test('deleteBranch uses the safe delete and surfaces refusals', async () => {
   await assert.rejects(
     () => deleteBranch(refused.run, 'E:/repo', 'x'),
     (error) => error instanceof GitError && error.code === 'DELETE_FAILED',
+  )
+})
+
+// ---------------------------------------------------------------- admission
+
+/**
+ * A fake host that captures the routes `apply` registers, plus the services the
+ * plugin reads. `connection` stands in for the host's admission service.
+ */
+function makeHost({ connection } = {}) {
+  const routes = new Map()
+  const services = new Map()
+  services.set('webServer', {
+    register(route) {
+      routes.set(route.path, route)
+      return () => routes.delete(route.path)
+    },
+  })
+  services.set('subprocess', {
+    resolveExecutable: async () => 'git',
+    spawn() {
+      throw new Error('no git command is expected in admission tests')
+    },
+  })
+  if (connection !== undefined) services.set('connection', connection)
+  const ctx = {
+    get: (service) => services.get(service),
+    effect(callback) {
+      callback()
+    },
+    inject(names, callback) {
+      // A cold scope: the plugin only receives the gate context once the host
+      // publishes the first service it asked for.
+      if (!services.has(names[0])) return { dispose() {} }
+      const inner = { get: (service) => services.get(service) }
+      return { dispose: callback(inner) }
+    },
+  }
+  apply(ctx)
+  return {
+    routes,
+    async call(path, req) {
+      const res = {
+        statusCode: 200,
+        headers: {},
+        body: '',
+        setHeader(name, value) {
+          this.headers[name.toLowerCase()] = String(value)
+        },
+        end(chunk) {
+          if (chunk !== undefined) this.body += String(chunk)
+        },
+      }
+      await routes.get(path).handler(req, res)
+      return { res, json: JSON.parse(res.body) }
+    },
+  }
+}
+
+function makeRequest({
+  method = 'GET',
+  url = '/dsh-git-branch/state',
+  headers = {},
+  remoteAddress = '127.0.0.1',
+  body,
+} = {}) {
+  const req = { method, url, headers, socket: { remoteAddress }, setEncoding() {} }
+  if (body !== undefined) {
+    req[Symbol.asyncIterator] = async function* iterate() {
+      yield body
+    }
+  }
+  return req
+}
+
+const MUTATION_HEADERS = {
+  'x-dsh-git-branch': '1',
+  'content-type': 'application/json',
+}
+
+test('the gate answers before any route logic runs', async () => {
+  const host = makeHost({ connection: { requestRejection: () => 401 } })
+  const { res, json } = await host.call('/dsh-git-branch/state', makeRequest({ remoteAddress: '192.168.1.9' }))
+  assert.equal(res.statusCode, 401)
+  assert.equal(json.code, 'UNAUTHORIZED')
+})
+
+test('a legacy gate returning undefined admits the request', async () => {
+  const host = makeHost({ connection: { requestRejection: () => undefined } })
+  const { res, json } = await host.call('/dsh-git-branch/state', makeRequest())
+  assert.equal(res.statusCode, 200)
+  assert.equal(json.code, 'NO_SESSION')
+})
+
+test('current hosts admit through connection.admit and receive request facts', async () => {
+  const seen = []
+  const host = makeHost({
+    connection: {
+      admit(facts) {
+        seen.push(facts)
+        return { peer: {} }
+      },
+    },
+  })
+  const { json } = await host.call(
+    '/dsh-git-branch/state',
+    makeRequest({ headers: { host: '127.0.0.1:7777' }, remoteAddress: '192.168.1.9' }),
+  )
+  // A non-loopback peer reaches the handler only because admission admitted it.
+  assert.equal(json.code, 'NO_SESSION')
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].url, 'http://127.0.0.1:7777/dsh-git-branch/state')
+  assert.equal(seen[0].method, 'GET')
+  assert.equal(seen[0].socket.remoteAddress, '192.168.1.9')
+})
+
+test('a rejection from connection.admit is returned as-is', async () => {
+  const host = makeHost({
+    connection: {
+      admit: () => ({ rejection: 401 }),
+    },
+  })
+  const { res, json } = await host.call(
+    '/dsh-git-branch/switch',
+    makeRequest({ method: 'POST', url: '/dsh-git-branch/switch' }),
+  )
+  assert.equal(res.statusCode, 401)
+  // The gate ran first: no mutation guard answered this request.
+  assert.equal(json.code, 'UNAUTHORIZED')
+})
+
+test('a gate that throws is a refusal', async () => {
+  const host = makeHost({
+    connection: {
+      admit() {
+        throw new Error('connection.authentication is not injected')
+      },
+    },
+  })
+  const { res, json } = await host.call('/dsh-git-branch/state', makeRequest())
+  assert.equal(res.statusCode, 403)
+  assert.equal(json.message, 'admission check failed')
+})
+
+test('an admit answer with neither peer nor rejection fails closed', async () => {
+  const host = makeHost({ connection: { admit: () => undefined } })
+  const { res } = await host.call('/dsh-git-branch/state', makeRequest())
+  assert.equal(res.statusCode, 403)
+})
+
+test('without a host gate non-loopback peers are refused', async () => {
+  const host = makeHost()
+  const { res, json } = await host.call('/dsh-git-branch/state', makeRequest({ remoteAddress: '192.168.1.9' }))
+  assert.equal(res.statusCode, 403)
+  assert.equal(json.message, 'loopback only')
+})
+
+test('mutation routes keep the client header without a host gate', async () => {
+  const host = makeHost()
+  const { res, json } = await host.call(
+    '/dsh-git-branch/switch',
+    makeRequest({ method: 'POST', url: '/dsh-git-branch/switch', headers: { 'content-type': 'application/json' } }),
+  )
+  assert.equal(res.statusCode, 403)
+  assert.equal(json.message, 'missing client header')
+})
+
+test('the host fence replaces the Origin stand-in', async () => {
+  const headers = { ...MUTATION_HEADERS, origin: 'https://gitbox.lan' }
+  const body = '{"sessionId":"s1"}'
+  const admitted = makeHost({ connection: { admit: () => ({ peer: {} }) } })
+  const gated = await admitted.call(
+    '/dsh-git-branch/switch',
+    makeRequest({ method: 'POST', url: '/dsh-git-branch/switch', headers, remoteAddress: '192.168.1.9', body }),
+  )
+  // A trusted-hostname deployment writes through instead of failing #729 again.
+  assert.equal(gated.json.code, 'NO_SESSION')
+
+  const local = makeHost()
+  const refused = await local.call(
+    '/dsh-git-branch/switch',
+    makeRequest({ method: 'POST', url: '/dsh-git-branch/switch', headers, body }),
+  )
+  assert.equal(refused.res.statusCode, 403)
+  assert.equal(refused.json.message, 'cross-origin request rejected')
+})
+
+test('every route registers under the plugin prefix', () => {
+  const host = makeHost()
+  assert.deepEqual(
+    [...host.routes.keys()].sort(),
+    [
+      '/dsh-git-branch/create',
+      '/dsh-git-branch/delete',
+      '/dsh-git-branch/init',
+      '/dsh-git-branch/state',
+      '/dsh-git-branch/switch',
+    ],
   )
 })
