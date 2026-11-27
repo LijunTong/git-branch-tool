@@ -346,11 +346,13 @@ test('deleteBranch uses the safe delete and surfaces refusals', async () => {
 
 /**
  * A fake host that captures the routes `apply` registers, plus the services the
- * plugin reads. `connection` stands in for the host's admission service.
+ * plugin reads. `connection` stands in for the host's admission service, `git`
+ * answers git invocations, and `directories` maps a session id to its cwd.
  */
-function makeHost({ connection } = {}) {
+function makeHost({ connection, git, agents, directories } = {}) {
   const routes = new Map()
   const services = new Map()
+  const tools = new Map()
   services.set('webServer', {
     register(route) {
       routes.set(route.path, route)
@@ -359,10 +361,33 @@ function makeHost({ connection } = {}) {
   })
   services.set('subprocess', {
     resolveExecutable: async () => 'git',
-    spawn() {
-      throw new Error('no git command is expected in admission tests')
+    spawn(request) {
+      if (git === undefined) throw new Error('no git command is expected in admission tests')
+      const answer = git(request.argv.slice(1)) ?? {}
+      const chunk = (text) => ({ readFrom: () => ({ text: text ?? '' }) })
+      return {
+        done: Promise.resolve({ exitCode: answer.code ?? 0, signal: null }),
+        collected: { stdout: chunk(answer.stdout), stderr: chunk(answer.stderr) },
+      }
     },
   })
+  services.set('tools', {
+    register(tool) {
+      tools.set(tool.name, tool)
+      return () => tools.delete(tool.name)
+    },
+  })
+  if (directories !== undefined) {
+    const cwdOf = (session) => directories[session?.id ?? String(session)] ?? ''
+    services.set('sessions', { get: (id) => (id in directories ? { id } : undefined) })
+    services.set('workingDirectory', { get: cwdOf, ensure: async (session) => cwdOf(session) })
+  }
+  if (agents !== undefined) {
+    services.set('agents', {
+      list: () => agents,
+      get: (id) => agents.find((agent) => agent.id === id),
+    })
+  }
   if (connection !== undefined) services.set('connection', connection)
   const ctx = {
     get: (service) => services.get(service),
@@ -380,6 +405,7 @@ function makeHost({ connection } = {}) {
   apply(ctx)
   return {
     routes,
+    tools,
     async call(path, req) {
       const res = {
         statusCode: 200,
@@ -538,4 +564,163 @@ test('every route registers under the plugin prefix', () => {
       '/dsh-git-branch/switch',
     ],
   )
+})
+
+// ------------------------------------------------------- checkout guard rails
+
+const GUARD_ROOT = 'E:/repo'
+
+/** Answers the git calls a guarded checkout makes, and records each one. */
+function guardGit({ status = '', branch = STATUS_BRANCH, exists = [] } = {}) {
+  const calls = []
+  const handler = (args) => {
+    calls.push(args)
+    const joined = args.join(' ')
+    if (joined === 'rev-parse --show-toplevel') return { stdout: `${GUARD_ROOT}\n` }
+    if (args[0] === 'show-ref') {
+      const ref = String(args[args.length - 1] ?? '').replace(/^refs\/(heads|remotes)\//u, '')
+      return { code: exists.includes(ref) ? 0 : 1 }
+    }
+    if (joined === 'status --porcelain=v2 --untracked-files=normal') return { stdout: status }
+    if (joined === 'status --porcelain=v2 --branch --untracked-files=normal') return { stdout: branch }
+    if (args[0] === 'for-each-ref') return { stdout: REFS }
+    if (args[0] === 'remote') return { stdout: 'origin\n' }
+    return {}
+  }
+  handler.calls = calls
+  return handler
+}
+
+function mutationRequest(path, body) {
+  return makeRequest({
+    method: 'POST',
+    url: `/dsh-git-branch/${path}`,
+    headers: MUTATION_HEADERS,
+    body: JSON.stringify(body),
+  })
+}
+
+const runningAgent = (id, sessionId) => [{ id, status: 'running', session: { id: sessionId } }]
+
+test('a running agent in the same repository blocks the switch', async () => {
+  const git = guardGit()
+  const host = makeHost({
+    git,
+    directories: { s1: GUARD_ROOT, s9: `${GUARD_ROOT}/sub` },
+    agents: runningAgent('a9', 's9'),
+  })
+  const { res, json } = await host.call('/dsh-git-branch/switch', mutationRequest('switch', { sessionId: 's1', name: 'feature/login' }))
+  assert.equal(res.statusCode, 200)
+  assert.equal(json.ok, false)
+  assert.equal(json.code, 'AGENT_BUSY')
+  assert.equal(json.busy.length, 1)
+  assert.equal(json.busy[0].sessionId, 'a9')
+  // Nothing reached git's checkout, so the branch is untouched.
+  assert.equal(git.calls.some((args) => args[0] === 'switch'), false)
+})
+
+test('an idle agent does not block the switch', async () => {
+  const git = guardGit({ exists: ['feature/login'] })
+  const host = makeHost({
+    git,
+    directories: { s1: GUARD_ROOT, s9: GUARD_ROOT },
+    agents: [{ id: 'a9', status: 'idle', session: { id: 's9' } }],
+  })
+  const { json } = await host.call('/dsh-git-branch/switch', mutationRequest('switch', { sessionId: 's1', name: 'feature/login' }))
+  assert.equal(json.ok, true)
+  assert.equal(json.switched.branch, 'feature/login')
+})
+
+test('a running agent in another repository does not block the switch', async () => {
+  const git = guardGit({ exists: ['feature/login'] })
+  const host = makeHost({
+    git,
+    directories: { s1: GUARD_ROOT, s9: 'E:/elsewhere' },
+    agents: runningAgent('a9', 's9'),
+  })
+  const { json } = await host.call('/dsh-git-branch/switch', mutationRequest('switch', { sessionId: 's1', name: 'feature/login' }))
+  assert.equal(json.ok, true)
+})
+
+test('a host without the agents service only checks the dirty tree', async () => {
+  const git = guardGit({ exists: ['feature/login'] })
+  const host = makeHost({ git, directories: { s1: GUARD_ROOT } })
+  const { json } = await host.call('/dsh-git-branch/switch', mutationRequest('switch', { sessionId: 's1', name: 'feature/login' }))
+  assert.equal(json.ok, true)
+})
+
+test('deleting a branch is not gated by a running agent', async () => {
+  const git = guardGit()
+  const host = makeHost({
+    git,
+    directories: { s1: GUARD_ROOT, s9: GUARD_ROOT },
+    agents: runningAgent('a9', 's9'),
+  })
+  const { json } = await host.call('/dsh-git-branch/delete', mutationRequest('delete', { sessionId: 's1', name: 'feature/login' }))
+  assert.equal(json.ok, true)
+  assert.equal(json.deleted.branch, 'feature/login')
+})
+
+test('a dirty tree asks for confirmation instead of switching', async () => {
+  const git = guardGit({ status: '1 .M N... 100644 100644 100644 aaaa bbbb src/a.js\n? src/new.js' })
+  const host = makeHost({ git, directories: { s1: GUARD_ROOT } })
+  const { json } = await host.call('/dsh-git-branch/switch', mutationRequest('switch', { sessionId: 's1', name: 'feature/login' }))
+  assert.equal(json.ok, false)
+  assert.equal(json.code, 'DIRTY_WORKTREE')
+  assert.equal(json.dirty.total, 2)
+  assert.equal(json.dirty.unstaged, 1)
+  assert.equal(json.dirty.untracked, 1)
+  assert.deepEqual(json.dirty.samples, ['src/a.js', 'src/new.js'])
+  assert.equal(git.calls.some((args) => args[0] === 'switch'), false)
+})
+
+test('confirmDirty performs the switch on a dirty tree', async () => {
+  const git = guardGit({ status: '1 .M N... 100644 100644 100644 aaaa bbbb src/a.js', exists: ['feature/login'] })
+  const host = makeHost({ git, directories: { s1: GUARD_ROOT } })
+  const { json } = await host.call(
+    '/dsh-git-branch/switch',
+    mutationRequest('switch', { sessionId: 's1', name: 'feature/login', confirmDirty: true }),
+  )
+  assert.equal(json.ok, true)
+  assert.equal(json.switched.branch, 'feature/login')
+})
+
+test('creating a branch honours the same dirty-tree confirmation', async () => {
+  const git = guardGit({ status: '? src/new.js' })
+  const host = makeHost({ git, directories: { s1: GUARD_ROOT } })
+  const refused = await host.call('/dsh-git-branch/create', mutationRequest('create', { sessionId: 's1', name: 'feat/x' }))
+  assert.equal(refused.json.code, 'DIRTY_WORKTREE')
+  const accepted = await host.call('/dsh-git-branch/create', mutationRequest('create', { sessionId: 's1', name: 'feat/x', confirmDirty: true }))
+  assert.equal(accepted.json.ok, true)
+})
+
+test('the tool exempts the agent that called it', async () => {
+  const git = guardGit({ exists: ['feature/login'] })
+  const host = makeHost({
+    git,
+    directories: { a9: GUARD_ROOT, s9: GUARD_ROOT },
+    agents: runningAgent('a9', 's9'),
+  })
+  const result = await host.tools.get('git_branch').execute(
+    { action: 'switch', branch: 'feature/login' },
+    { agent: { id: 'a9' } },
+  )
+  assert.equal(typeof result.report, 'string')
+  assert.equal(git.calls.some((args) => args[0] === 'switch'), true)
+})
+
+test('the state route reports the agents running in the repository', async () => {
+  const git = guardGit()
+  const host = makeHost({
+    git,
+    directories: { s1: GUARD_ROOT, s9: GUARD_ROOT },
+    agents: runningAgent('a9', 's9'),
+  })
+  const { json } = await host.call(
+    '/dsh-git-branch/state',
+    makeRequest({ url: '/dsh-git-branch/state?sessionId=s1' }),
+  )
+  assert.equal(json.ok, true)
+  assert.equal(json.busy.length, 1)
+  assert.equal(json.busy[0].sessionId, 'a9')
 })
