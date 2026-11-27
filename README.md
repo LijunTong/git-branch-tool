@@ -47,13 +47,13 @@ plugin_manager action=install_bundle target=<此目录绝对路径>
 | 文件 | 作用 |
 | --- | --- |
 | `lib/git.js` | 纯 git 核心：探测仓库、读状态、切换、新建、初始化、删除；只依赖注入的 `run(args)` |
-| `lib/index.js` | Host 半侧：4 个 loopback HTTP 路由 + `git_branch` 工具 + `/branch` 命令 |
+| `lib/index.js` | Host 半侧：5 个 HTTP 路由（宿主发布准入检查时走宿主 gate，否则回退 loopback）+ `git_branch` 工具 + `/branch` 命令 |
 | `lib/client.js` | Client 半侧：分支控件、面板、设置页；只 require `react` 与 `react-dom` |
 | `cordis.patch.yml` | bundle 插入行 |
 | `locale/*.json` | Plugin Manager 的标题 / 描述 / 详情路径 |
 | `docs/DETAIL.md` | 详情页文档 |
 | `docs/images/*.png` | 上面四张界面图（2× 截图，深色主题） |
-| `test/git.test.mjs` | 假 runner 的核心逻辑测试（不需要真仓库） |
+| `test/git.test.mjs` | 假 runner 的核心逻辑测试 + 5 条路由的准入 / 守卫测试（不需要真仓库） |
 
 ## 开发
 
@@ -61,7 +61,7 @@ plugin_manager action=install_bundle target=<此目录绝对路径>
 node --test test/
 ```
 
-只测 `lib/git.js`（纯函数 + 注入 runner），Host 路由与 UI 通过安装后的实际界面验证。
+覆盖 `lib/git.js`（纯函数 + 注入 runner）与 `lib/index.js` 的 5 条路由（宿主准入、fail-closed、cross-origin 兜底）；UI 与网关侧行为通过安装后的实际界面验证。
 
 ## 投稿到插件市场
 
