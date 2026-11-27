@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Switch and create Git branches from the DSH conversation, with repository init and a configurable chip position.",
+  "description-zh": "在 DSH 对话中切换与创建 Git 分支，支持初始化仓库并自定义入口标签位置。",
   "keywords": [
     "dsh",
     "git"
